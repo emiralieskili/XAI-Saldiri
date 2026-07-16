@@ -1,0 +1,14 @@
+# Python sanal ortamı
+.venv/
+venv/
+ENV/
+
+# Model ağırlıkları ve geçici dosyalar (Bunlar GitHub'a yüklenmeyecek)
+modeller/
+sonuclar/
+loglar/
+*.html
+
+# Python önbellek dosyaları
+**/__pycache__/
+*.pyc
