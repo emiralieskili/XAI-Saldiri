@@ -4,54 +4,97 @@ from lime.lime_text import LimeTextExplainer
 import numpy as np
 
 def main():
-    print("1. Eğitilmiş model yükleniyor...")
+    print("1. Donanım Kontrol Ediliyor ve Temizleniyor")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Kullanılan Cihaz: {device}")
+
+    print("\n2. Eğitilmiş model yükleniyor...")
     model_path = "./modeller/hukuk_bert_model"
+    
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForSequenceClassification.from_pretrained(model_path)
-    model.eval() # Modeli test moduna alıyoruz
+    
+    # Modeli ekran kartına taşı ve test moduna al
+    model.to(device)
+    model.eval()
 
-    # Sınıf etiketlerimiz
+    # Sınıf etiketleri
     class_names = ["contradiction", "entailment", "neutral"]
 
-    # 2. Örnek bir test davası (Premise ve Hypothesis birleşik formatta)
-    # LIME metin üzerinde çalışırken tek bir metin girdisi bekler.
-    # Bu yüzden araya BERT'in ayırıcı tokenı olan [SEP]'i koyarak birleştiriyoruz.
+    # Örnek test davası metinlerinin tanımlanması
     premise = "Davacı, elektrik faturası borcunu ödemeyen davalıya karşı icra takibi başlatmıştır."
     hypothesis = "Davalı tarafın kredi kartı borcu yüzünden maaşına haciz konulmuştur."
-    
-    birlesik_metin = f"{premise} [SEP] {hypothesis}"
 
-    # LIME için model tahmin fonksiyonu
+    # LIME tek bir metin girdisi kabul ettiği için iki metin özel bir ayırıcıyla (" | ") birleştirilir.
+    birlesik_metin = f"{premise} | {hypothesis}"
+
+    # LIME'ın arka planda kelimeleri maskelerken kullanacağı BATCH OPTİMİZE EDİLMİŞ tahmin fonksiyonu.
     def predictor(texts):
-        outputs = []
+        p_list = []
+        h_list = []
+        
+        # Metinleri böl ve listelere topla
         for text in texts:
-            parts = text.split("[SEP]")
-            p = parts[0]
-            h = parts[1] if len(parts) > 1 else ""
+            parts = text.split(" | ")
+            p_list.append(parts[0])
+            h_list.append(parts[1] if len(parts) > 1 else "")
+
+        all_probs = []
+        batch_size = 32 # GPU belleğinin taşmaması için otuz ikişerlik paketler halinde işle
+
+        for i in range(0, len(texts), batch_size):
+            # İlgili paketlere ait premise (p) ve hypothesis (h) dilimlerini ayrıştır
+            batch_p = p_list[i:i + batch_size]
+            batch_h = h_list[i:i + batch_size]
+
+            # Metinler GPU için tokenize et
+            # Paket içindeki metinler BERT'in işleyebileceği PyTorch tensörlerine dönüştür
+            # max_length=256 ve padding ile tüm girdiler sabit boyuta getirilerek matris oluştur
+            inputs = tokenizer(
+                batch_p, 
+                batch_h, 
+                return_tensors="pt", 
+                truncation=True, 
+                padding="max_length", 
+                max_length=256
+            )
             
-            inputs = tokenizer(p, h, return_tensors="pt", truncation=True, padding="max_length", max_length=256)
+            # Tensörleri GPU'ya taşı
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            # GPU üzerinde toplu tahmin (Batch Inference)
             with torch.no_grad():
                 logits = model(**inputs).logits
-                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
-                outputs.append(probs)
-        return np.array(outputs)
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()
+                all_probs.append(probs)
+        
+            # Bellekte biriken geçici verileri temizle
+            del inputs, logits
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    print("\n2. LIME Açıklayıcı hazırlanıyor...")
-    explainer = LimeTextExplainer(class_names=class_names)
+        return np.vstack(all_probs)
 
-    print("\n3. Karar açıklanıyor (Bu işlem 1-2 dakika sürebilir)...")
-    # LIME kelimeleri rastgele maskeleyerek modelin tepki sınırlarını çözecek
+    print("\n3. LIME Açıklayıcı hazırlanıyor...")
+    explainer = LimeTextExplainer(
+        class_names=class_names,
+        split_expression=lambda text: [x for x in text.split() if x != "|"],
+        random_state=42  # Sonuçların sabit ve tekrarlanabilir olması için
+    )
+
+    print("\n4. Karar açıklanıyor (GPU Hızlandırmalı)...")
     exp = explainer.explain_instance(
         birlesik_metin, 
         predictor, 
-        num_features=10, # En etkili 10 kelimeyi göster
-        num_samples=100  # Doğruluk için test örnek sayısı
+        num_features=10,
+        num_samples=3000  # GPU aktif olduğu için 3000 yapmak çok zaman almaz
     )
 
     print("\n--- MODELİN KARARI VE GEREKÇESİ ---")
     print(f"Metin: {birlesik_metin}\n")
     
-    # Modelin ham tahminini hesapla
     tahmin_olasiliklari = predictor([birlesik_metin])[0]
     en_yuksek_sinif = np.argmax(tahmin_olasiliklari)
     print(f"Tahmin: {class_names[en_yuksek_sinif]} (%{tahmin_olasiliklari[en_yuksek_sinif]*100:.2f} güven oranı)")
@@ -61,7 +104,6 @@ def main():
         yon = "DESTEKLİYOR (+)" if agirlik > 0 else "ENGELLİYOR (-)"
         print(f"Kelime: '{kelime}' -> Ağırlık: {agirlik:.4f} ({yon})")
 
-    # Sonuçları görsel HTML raporu olarak kaydet
     exp.save_to_file("lime_aciklama.html")
     print("\nDetaylı görsel rapor 'lime_aciklama.html' olarak kaydedildi!")
 
