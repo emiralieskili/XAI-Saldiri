@@ -1,54 +1,104 @@
 import torch
+import numpy as np
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from lime.lime_text import LimeTextExplainer
 
-# Modelin verilen iki metin arasındaki ilişkiyi tahmin etmesini sağlayan yardımcı fonksiyon
-def get_prediction(premise, hypothesis, model, tokenizer):
-    # İddia ve varsayım metinleri modelin işleyebileceği sayısal matris yapılarına dönüştürülür
-    inputs = tokenizer(premise, hypothesis, return_tensors="pt", truncation=True, padding="max_length", max_length=256)
-    # Gradyan takibi kapatılarak sadece ileri besleme (inference) hesaplaması yapılır
-    with torch.no_grad():
-        logits = model(**inputs).logits
-        # Modelin ham skor çıktıları (logits) sınıf olasılıklarına dönüştürülür
-        probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
-    return probs
+# LIME'ın türettiği yapay metinleri GPU/CPU üzerinde paketler halinde işleyen tahmin fonksiyonu
+def predictor(texts, model, tokenizer, device):
+    all_probs = []
+    batch_size = 32  # GPU VRAM belleğinin dolmasını (OOM) önlemek için toplu işleme boyutu
+    
+    # Metin listesini 32'şerli paketler halinde döngüye al
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i + batch_size]
+        premises = []
+        hypotheses = []
+        
+        # ' | ' ayıracı ile birleştirilmiş metinleri iddia (premise) ve varsayım (hypothesis) olarak ayır
+        for text in batch_texts:
+            parts = text.split(" | ")
+            premises.append(parts[0])
+            hypotheses.append(parts[1] if len(parts) > 1 else "")
+            
+        # Metin çiftlerini BERT modelinin işleyebileceği sayısal tensörlere dönüştür
+        inputs = tokenizer(
+            premises, 
+            hypotheses, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=256
+        ).to(device)
+        
+        # Gradyan takibini kapatıp model tahminlerini hesapla
+        with torch.no_grad():
+            logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()  # Ham skorları sınıf olasılıklarına dönüştür
+            all_probs.append(probs)
+            
+        # Her işlem paketinden sonra geçici tensörleri ve GPU belleğini temizle
+        del inputs, logits
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+    return np.vstack(all_probs)
 
 def main():
-    # Kaydedilen modelin yolu
+    # Donanım kontrolü (GPU varsa CUDA, yoksa CPU kullanılır)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Eğitilmiş model ve tokenizer ağırlıklarının yükleneceği dizin
     model_path = "./modeller/hukuk_bert_model"
-    # Kaydedilmiş model ağırlıklarını yükle
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForSequenceClassification.from_pretrained(model_path)
-    model.eval()    # Modeli test moduna al
+    
+    model.to(device)
+    model.eval()  # Modeli değerlendirme (test) moduna al
 
-    class_names = ["contradiction", "entailment", "neutral"]    # Veri setindeki sınıflandırma etiketleri
+    class_names = ["contradiction", "entailment", "neutral"]  # Sınıf etiketleri
 
-    # 1. Orijinal Metinler
+    # 1. Orijinal ve Adversarial (Saldırı Amaçlı Manipüle Edilmiş) Metin Çiftleri
     p_orig = "Davacı, elektrik faturası borcunu ödemeyen davalıya karşı icra takibi başlatmıştır."
     h_orig = "Davalı tarafın kredi kartı borcu yüzünden maaşına haciz konulmuştur."
+    text_orig = f"{p_orig} | {h_orig}"
 
-    # 2. LIME Çıktılarına Göre Manipüle Edilmiş (Adversarial) Metinler
-    # İnsanlar için anlam korunurken, model için kritik olan "borcunu", "icra takibi" ve "haciz konulmuştur" ifadeleri
-    # sırasıyla "ödemesini", "hukuki süreç" ve "bloke konulmuştur" kelimeleriyle değiştirilerek saldırı tasarlanmıştır
     p_adv = "Davacı, elektrik faturası ödemesini yapmayan davalıya karşı hukuki süreç başlatmıştır."
     h_adv = "Davalı tarafın kredi kartı borcu yüzünden maaşına bloke konulmuştur."
+    text_adv = f"{p_adv} | {h_adv}"
 
-    # Hem orijinal hem de saldırı amaçlı hazırlanan metin çiftlerinin tahmin olasılıkları hesapla
-    probs_orig = get_prediction(p_orig, h_orig, model, tokenizer)
-    probs_adv = get_prediction(p_adv, h_adv, model, tokenizer)
+    # 2. Hızlı Tahmin Karşılaştırması (Terminal Çıktısı)
+    probs_orig = predictor([text_orig], model, tokenizer, device)[0]
+    probs_adv = predictor([text_adv], model, tokenizer, device)[0]
 
-    # Saldırı öncesi modelin ham metne verdiği yanıtlar ve sınıfların yüzde oranları yazdırılır
     print("=== SALDIRI ÖNCESİ (ORİJİNAL) ===")
-    print(f"Premise: {p_orig}")
-    print(f"Hypothesis: {h_orig}")
     for idx, name in enumerate(class_names):
         print(f"{name}: %{probs_orig[idx]*100:.2f}")
 
-    # Saldırı sonrası modelin manipüle edilmiş metne verdiği yanıtlar yazdırılarak aradaki kararlılık farkı ölçülür
     print("\n=== SALDIRI SONRASI (ADVERSARIAL) ===")
-    print(f"Premise: {p_adv}")
-    print(f"Hypothesis: {h_adv}")
     for idx, name in enumerate(class_names):
         print(f"{name}: %{probs_adv[idx]*100:.2f}")
+
+    # 3. LIME Açıklayıcı Kurulumu
+    # '|' karakterini kelime olarak değerlendirmemek için özel split fonksiyonu ve sabit seed tanımlandı
+    explainer = LimeTextExplainer(
+        class_names=class_names,
+        split_expression=lambda x: [w for w in x.split() if w != "|"],
+        random_state=42
+    )
+
+    # 4. Sadece Saldırı Metni İçin LIME Analizinin Çalıştırılması ve HTML Olarak Kaydedilmesi
+    print("\nSaldırı metninin LIME açıklaması oluşturuluyor...")
+    exp_adv = explainer.explain_instance(
+        text_adv, 
+        lambda x: predictor(x, model, tokenizer, device), 
+        num_features=10, 
+        num_samples=3000
+    )
+    exp_adv.save_to_file('saldiri_aciklama.html')
+
+    print("İşlem tamamlandı! 'saldiri_aciklama.html' başarıyla oluşturuldu.")
 
 if __name__ == "__main__":
     main()
