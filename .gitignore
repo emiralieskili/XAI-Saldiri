@@ -7,7 +7,6 @@ ENV/
 modeller/
 sonuclar/
 loglar/
-*.html
 
 # Python önbellek dosyaları
 **/__pycache__/
