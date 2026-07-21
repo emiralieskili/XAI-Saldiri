@@ -13,7 +13,7 @@ def encode_labels(example):
 def main():
     print("1. Cihaz kontrol ediliyor...")
     device = "cuda" if torch.cuda.is_available() else "cpu" # GPU aktifse GPU'yu değilse CPU'u kullan
-    print(f"Kullanılan Cihaz: {device.upper()}")
+    print(f"Kullanılan Cihaz: {str(device).upper()}")
 
     print("\n2. Veri seti yükleniyor...")
     dataset = load_dataset("Turkish-NLI/legal_nli_TR_V1")

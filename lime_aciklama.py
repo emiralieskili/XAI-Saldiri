@@ -4,11 +4,11 @@ from lime.lime_text import LimeTextExplainer
 import numpy as np
 
 def main():
-    print("1. Donanım Kontrol Ediliyor ve Temizleniyor")
+    print("1. Cihaz Kontrol Ediliyor ve Temizleniyor")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Kullanılan Cihaz: {device}")
+    print(f"Kullanılan Cihaz: {str(device).upper()}")
 
     print("\n2. Eğitilmiş model yükleniyor...")
     model_path = "./modeller/hukuk_bert_model"
